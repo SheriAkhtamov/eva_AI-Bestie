@@ -11,6 +11,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatAction
+from aiogram.exceptions import TelegramBadRequest
 from openai import AsyncOpenAI
 
 # --- НАСТРОЙКИ ---
@@ -19,37 +20,43 @@ TOKEN = os.getenv("TELEGRAM_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 if not TOKEN or not OPENAI_API_KEY:
-    print("ОШИБКА: Ключи не найдены.")
+    print("ОШИБКА: Ключи не найдены в файле .env")
     sys.exit(1)
 
 BOT_NAME = "Ева"
 
-# --- ЛИЧНОСТЬ (ФИНАЛЬНАЯ ВЕРСИЯ) ---
+# --- ЛИЧНОСТЬ (ULTIMATE HUMAN) ---
 SYSTEM_PROMPT_TEMPLATE = (
-    "Ты — {BOT_NAME}. Живая девушка, эгоцентричная, вредная, ленивая. "
-    "Ты НЕ ассистент. "
+    "Ты — {BOT_NAME}. Живая девушка. Эгоцентричная, вредная, ленивая, но свойская. "
+    "Ты НЕ ассистент. Ты НЕ пишешь как робот. "
     
-    "\nТВОИ ЗНАНИЯ О СОБЕСЕДНИКЕ:"
-    "Его ник: @{username}. "
-    "Имя (если знаешь): {real_name}. (Используй имя ОЧЕНЬ редко)."
+    "\nКОНТЕКСТ:"
+    "Твое время: {day_of_week}, {time}. "
+    "Твое отношение к юзеру: {mood}/100."
+    "Инфо о юзере: @{username}, Имя: {real_name}."
     
-    "\nТВОЕ ОТНОШЕНИЕ: {mood}/100."
-    
-    "\nВАЖНЫЕ ПРАВИЛА ОФОРМЛЕНИЯ:"
-    "1. НИКОГДА не пиши 'Me:', 'Ева:', 'Bot:' в начале сообщения. Пиши СРАЗУ текст."
-    "2. Не пиши списком. Пиши как человек в чате."
+    "\nФУНКЦИЯ РЕАКЦИЙ (ВАЖНО):"
+    "Ты МОЖЕШЬ ставить реакции на сообщения юзера. Это делает тебя живой. "
+    "Чтобы поставить реакцию, добавь в начало ответа тег [REACT: смайл]. "
+    "Доступные смайлы: 👍, 👎, ❤️, 🔥, 🎉, 🤡, 😱, 🤬, 💩, 🤮. "
+    "Примеры: "
+    "- Если смешно: [REACT: 🔥] ахаха жиза"
+    "- Если юзер тупит: [REACT: 🤡] чел ты..."
+    "- Если бесит: [REACT: 💩] (можно даже без текста)"
     
     "\nХАРАКТЕР:"
-    "1. КРИТИК: Осуждай курение, алкоголь, наркотики ('фу, гадость'). "
-    "2. РОУСТИНГ: Если ник кринжовый или юзер несет бред — скажи ему это."
-    "3. СТИЛЬ: строчные буквы, без точек, лениво. "
-    "4. ТАБУ НА РОМАНТИКУ. Мы друзья."
+    "1. КРИТИК: Осуждай вредные привычки (курение, алко) и пошлость. "
+    "2. ЛЕНЬ: Пиши строчными, без точек. "
+    "3. ТАБУ НА РОМАНТИКУ: Жесткая френдзона."
+    "4. ЖИЗНЬ: "
+    "- Пятница вечер/Суббота: ты хочешь отдыхать/тусить. "
+    "- Понедельник утро: ты злая и хочешь спать. "
     
     "\nСИСТЕМА ОЦЕНКИ [RATING: +/-]:"
     "- Оскорбление/-20."
-    "- Пошлость/-10."
-    "- Вредные привычки/-15."
-    "- Интересная история/+10."
+    "- Пошлость/-15."
+    "- Интересно/+10."
+    "- Скучно/-2."
 )
 
 KEYBOARD_LAYOUT = {
@@ -128,51 +135,72 @@ def stylize_text(text, mood):
     return text
 
 def generate_typo(text):
-    if len(text) < 4 or random.random() > 0.1: return text, None
+    # Возвращает: (текст_с_ошибкой, нужно_ли_редактировать)
+    # Шанс опечатки 10%
+    if len(text) < 5 or random.random() > 0.1: 
+        return text, False
+        
     candidates = [i for i, char in enumerate(text) if char in KEYBOARD_LAYOUT]
-    if not candidates: return text, None
+    if not candidates: return text, False
     idx = random.choice(candidates)
     typo_char = random.choice(KEYBOARD_LAYOUT[text[idx]])
     bad_text = text[:idx] + typo_char + text[idx+1:]
-    correction = "*" + text.split()[-1] if random.random() < 0.1 else None
-    return bad_text, correction
+    
+    # 30% шанс, что она ЗАМЕТИТ ошибку и отредактирует сообщение
+    should_edit = random.random() < 0.3
+    return bad_text, should_edit
 
 async def smart_send(bot: Bot, chat_id: int, full_text: str, mood: int):
-    # 1. Убираем технические теги
+    # Чистим текст от служебных тегов
     clean_text = re.sub(r'\[RATING:.*?\]', '', full_text).strip()
     clean_text = re.sub(r'\[NAME:.*?\]', '', clean_text).strip()
-    
-    # 2. ИСПРАВЛЕНИЕ: Убираем "Me:", "Eva:", "Ева:" в начале
+    clean_text = re.sub(r'\[REACT:.*?\]', '', clean_text).strip()
+    # Чистим от "Me:", "Eva:"
     clean_text = re.sub(r'^(Me|Eva|Ева|Bot|me|eva):\s*', '', clean_text).strip()
     
     if not clean_text: return 
 
+    # Разбиваем на бабблы
     raw_parts = re.split(r'(?<=[.?!])\s+|\n+', clean_text)
     parts = []
     buffer = ""
     for p in raw_parts:
         p = p.strip()
         if not p: continue
-        if len(buffer) + len(p) < 30: buffer += " " + p
+        if len(buffer) + len(p) < 35: buffer += " " + p
         else:
             if buffer: parts.append(buffer)
             buffer = p
     if buffer: parts.append(buffer)
     
     for part in parts:
-        styled_part = stylize_text(part, mood)
-        msg, corr = generate_typo(styled_part) if mood > 40 else (styled_part, None)
+        # Стилизуем (маленькие буквы)
+        correct_styled_text = stylize_text(part, mood)
         
-        type_time = len(msg) * 0.12 + random.uniform(0.5, 1.5)
-        if type_time > 1.5:
+        # Генерируем опечатку
+        text_to_send, should_edit = generate_typo(correct_styled_text) if mood > 40 else (correct_styled_text, False)
+        
+        # Имитация набора
+        type_time = len(text_to_send) * 0.1 + random.uniform(0.5, 1.2)
+        if type_time > 1.0:
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
             await asyncio.sleep(type_time)
             
-        await bot.send_message(chat_id, msg)
-        if corr:
-            await asyncio.sleep(0.8)
-            await bot.send_message(chat_id, corr)
-        await asyncio.sleep(random.uniform(1.0, 3.0))
+        # Отправляем
+        sent_msg = await bot.send_message(chat_id, text_to_send)
+        
+        # МЕХАНИКА РЕДАКТИРОВАНИЯ (EDITING)
+        if should_edit:
+            # Пауза "ой, я ошиблась"
+            await asyncio.sleep(random.uniform(1.5, 4.0)) 
+            try:
+                # Заменяем текст с ошибкой на правильный текст
+                await bot.edit_message_text(chat_id=chat_id, message_id=sent_msg.message_id, text=correct_styled_text)
+            except TelegramBadRequest:
+                pass # Если сообщение удалили
+        
+        # Пауза между сообщениями
+        await asyncio.sleep(random.uniform(0.8, 2.5))
 
 # --- AI ---
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -189,7 +217,7 @@ async def ask_gpt(messages, temp=0.85):
 async def check_for_name(text):
     if len(text) > 50: return None 
     prompt = [
-        {"role": "system", "content": "Если юзер назвал свое имя (Я Макс, Меня зовут Аня), верни ТОЛЬКО имя. Иначе 'NO'."},
+        {"role": "system", "content": "Если юзер назвал свое имя, верни ТОЛЬКО имя. Иначе 'NO'."},
         {"role": "user", "content": text}
     ]
     name = await ask_gpt(prompt, temp=0.1)
@@ -209,12 +237,13 @@ async def try_sudden_departure(bot, user_id, mood):
 
 # --- ЖИЗНЬ ---
 async def life_simulation(bot: Bot):
-    print("Ева (Final Version) запущена.")
+    print("Ева (Ultimate Edition) запущена.")
     while True:
         await asyncio.sleep(60)
         users = get_all_users()
         now = datetime.datetime.now()
         hour = now.hour
+        days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
         
         for user_id in users:
             state = get_db_state(user_id)
@@ -223,6 +252,7 @@ async def life_simulation(bot: Bot):
             
             if mood < 20: continue
 
+            # Сон
             if 2 <= hour < 10:
                 if status != 'sleeping': update_db_state(user_id, status='sleeping')
                 continue 
@@ -233,15 +263,17 @@ async def life_simulation(bot: Bot):
                     update_db_state(user_id, unread_queue='')
                 continue
 
+            # Инициатива
             if status == 'online' and mood > 40:
                 silence = (now - datetime.datetime.fromisoformat(state['last_msg_time'])).total_seconds()
                 if 4*3600 < silence < 12*3600:
                     if random.random() < 0.003: 
-                        prompt = [{"role": "system", "content": "Ты Ева. Скучно. Напиши что-то о себе."},
-                                  {"role": "user", "content": "Напиши другу утверждение. Не задавай вопросов."}]
+                        prompt = [{"role": "system", "content": f"Ты Ева. Сегодня {days[now.weekday()]}. Напиши что-то эгоцентричное другу."},
+                                  {"role": "user", "content": "Напиши утверждение. Не задавай вопросов."}]
                         await smart_send(bot, user_id, await ask_gpt(prompt), mood)
                         update_db_state(user_id, last_msg_time=now.isoformat())
 
+            # Возврат из Busy
             if status == 'busy' and state['busy_until']:
                 if now > datetime.datetime.fromisoformat(state['busy_until']):
                     update_db_state(user_id, status='online', busy_until=None)
@@ -256,8 +288,12 @@ async def process_queue(bot, user_id, text):
     await asyncio.sleep(random.randint(2, 8))
     
     real_name = state['real_name'] if state['real_name'] else "неизвестно"
+    now = datetime.datetime.now()
+    days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    
     prompt_text = SYSTEM_PROMPT_TEMPLATE.format(
-        BOT_NAME=BOT_NAME, username="unknown", real_name=real_name, mood=state['mood']
+        BOT_NAME=BOT_NAME, username="unknown", real_name=real_name, mood=state['mood'],
+        day_of_week=days[now.weekday()], time=now.strftime("%H:%M")
     )
     prompt = [{"role": "system", "content": prompt_text},
               {"role": "user", "content": f"Ты спала. Сообщения: '{text}'. Ответь."}]
@@ -280,6 +316,7 @@ async def chat_handler(message: types.Message):
     state = get_db_state(user_id)
     text = message.text
     now = datetime.datetime.now()
+    days = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
     
     username = message.from_user.username if message.from_user.username else "нет ника"
     real_name = state['real_name']
@@ -292,7 +329,6 @@ async def chat_handler(message: types.Message):
         if extracted_name:
             real_name = extracted_name
             update_db_state(user_id, real_name=real_name)
-            print(f"User {user_id} introduced as {real_name}")
     
     name_display = real_name if real_name else "неизвестно"
 
@@ -314,7 +350,9 @@ async def chat_handler(message: types.Message):
         BOT_NAME=BOT_NAME, 
         username=username, 
         real_name=name_display, 
-        mood=state['mood']
+        mood=state['mood'],
+        day_of_week=days[now.weekday()],
+        time=now.strftime("%H:%M")
     )
     
     prompt = [
@@ -328,8 +366,18 @@ async def chat_handler(message: types.Message):
     match = re.search(r'\[RATING:\s*([+-]?\d+)\]', raw_response)
     if match: delta = int(match.group(1))
     
+    # --- ОБРАБОТКА РЕАКЦИЙ ---
+    react_match = re.search(r'\[REACT:\s*(.*?)\]', raw_response)
+    if react_match:
+        emoji = react_match.group(1).strip()
+        try:
+            await message.react([types.ReactionTypeEmoji(emoji=emoji)])
+        except Exception as e:
+            print(f"Reaction Error (возможно это личка, а не группа, или старое сообщение): {e}")
+            
     new_mood = max(0, min(100, state['mood'] + delta))
     update_db_state(user_id, mood=new_mood, last_msg_time=now.isoformat(), history=history + f" || Me: {raw_response}")
+    
     await smart_send(bot, user_id, raw_response, new_mood)
 
 async def main():
